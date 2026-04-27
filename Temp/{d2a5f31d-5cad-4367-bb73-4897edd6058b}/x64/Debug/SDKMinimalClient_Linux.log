@@ -1,0 +1,1 @@
+﻿D:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Microsoft\VC\v180\Microsoft.CppBuild.targets(474,5): error MSB8020: 找不到 "Remote_GCC_1_0" 应用程序类型 Linux (平台工具集 = "Remote_GCC_1_0")的生成工具。请安装此应用程序类型的工作流，并包含此项的生成工具: 

@@ -1,0 +1,17 @@
+# Visual Studio cache
+.vs/
+*.ipch
+*.pch
+
+# Build outputs
+Debug/
+Release/
+x64/
+x86/
+build/
+out/
+bin/
+obj/
+
+# Large SDK binary libraries
+SDKClient_Linux/ManusSDK/lib/*.so
