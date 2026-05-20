@@ -9,12 +9,41 @@
 #include <sstream>
 #include <iomanip>
 #include <chrono>
+#include <algorithm>
+#include <cstdint>
 
 #include "ClientLogging.hpp"
 
 using ManusSDK::ClientLog;
 
 SDKMinimalClient* SDKMinimalClient::s_Instance = nullptr;
+
+namespace
+{
+	uint64_t SystemNowMs()
+	{
+		const auto now = std::chrono::system_clock::now();
+		return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count());
+	}
+
+	uint64_t SteadyNowMs()
+	{
+		const auto now = std::chrono::steady_clock::now();
+		return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count());
+	}
+
+	void WriteNullableTimestamp(std::stringstream& json, uint64_t value)
+	{
+		if (value == 0)
+		{
+			json << "null";
+		}
+		else
+		{
+			json << value;
+		}
+	}
+}
 
 int main()
 {
@@ -45,6 +74,10 @@ SDKMinimalClient::~SDKMinimalClient()
 {
 	s_Instance = nullptr;
 	CloseSocket();
+	delete m_NextRawSkeleton;
+	delete m_RawSkeleton;
+	delete m_NextTrackerData;
+	delete m_TrackerData;
 }
 
 /// @brief Initialize the sample console and the SDK.
@@ -233,6 +266,32 @@ void SDKMinimalClient::CloseSocket() {
 	m_SocketInitialized = false;
 }
 
+bool SDKMinimalClient::SendJsonLine(const std::string& jsonData) {
+	if (m_ClientSocket == INVALID_SOCKET_VAL || !m_SocketInitialized) {
+		return false;
+	}
+
+	std::string jsonLine = jsonData + "\n";
+	const char* buffer = jsonLine.c_str();
+	size_t remaining = jsonLine.size();
+
+	while (remaining > 0) {
+		const int chunkSize = static_cast<int>(std::min<size_t>(remaining, 4096));
+		const int bytesSent = send(m_ClientSocket, buffer, chunkSize, 0);
+
+		if (bytesSent <= 0) {
+			ClientLog::warn("Failed to send JSONL data to Python. Socket may be disconnected.");
+			CloseSocket();
+			return false;
+		}
+
+		buffer += bytesSent;
+		remaining -= static_cast<size_t>(bytesSent);
+	}
+
+	return true;
+}
+
 std::string SDKMinimalClient::SkeletonToJSON(const ClientRawSkeletonCollection* data) {
 	if (!data || data->skeletons.empty()) {
 		return "{}";
@@ -297,18 +356,7 @@ void SDKMinimalClient::SendSkeletonData(const ClientRawSkeletonCollection* data)
 
 	try {
 		std::string jsonData = SkeletonToJSON(data);
-
-		// Add newline as message separator
-		jsonData += "\n";
-
-		// Send data
-		int bytesSent = send(m_ClientSocket, jsonData.c_str(), static_cast<int>(jsonData.length()), 0);
-
-		if (bytesSent < 0) {
-			// Send failed, connection may be broken
-			ClientLog::warn("Failed to send data to Python. Socket may be disconnected.");
-			CloseSocket();
-		}
+		SendJsonLine(jsonData);
 	} catch (const std::exception& e) {
 		ClientLog::error("Error sending skeleton data: {}", e.what());
 	}
@@ -323,8 +371,11 @@ void SDKMinimalClient::OnRawSkeletonStreamCallback(const SkeletonStreamInfo* con
 {
 	if (s_Instance)
 	{
+		const uint64_t t_ReceiveMonotonicMs = SteadyNowMs();
 		ClientRawSkeletonCollection* t_NxtClientRawSkeleton = new ClientRawSkeletonCollection();
 		t_NxtClientRawSkeleton->skeletons.resize(p_RawSkeletonStreamInfo->skeletonsCount);
+		t_NxtClientRawSkeleton->publishTime = p_RawSkeletonStreamInfo->publishTime.time;
+		t_NxtClientRawSkeleton->receiveMonotonicMs = t_ReceiveMonotonicMs;
 
 		for (uint32_t i = 0; i < p_RawSkeletonStreamInfo->skeletonsCount; i++)
 		{
@@ -341,6 +392,7 @@ void SDKMinimalClient::OnRawSkeletonStreamCallback(const SkeletonStreamInfo* con
 		// s_Instance->SendSkeletonData(t_NxtClientRawSkeleton);
 
 		s_Instance->m_RawSkeletonMutex.lock();
+		t_NxtClientRawSkeleton->callbackIndex = ++s_Instance->m_SkeletonCallbackCounter;
 		if (s_Instance->m_NextRawSkeleton != nullptr) delete s_Instance->m_NextRawSkeleton;
 		s_Instance->m_NextRawSkeleton = t_NxtClientRawSkeleton;
 		s_Instance->m_RawSkeletonMutex.unlock();
@@ -355,9 +407,12 @@ void SDKMinimalClient::OnTrackerStreamCallback(const TrackerStreamInfo* const p_
 {
 	if (s_Instance)
 	{
+		const uint64_t t_ReceiveMonotonicMs = SteadyNowMs();
 		TrackerDataCollection* t_TrackerData = new TrackerDataCollection();
 
 		t_TrackerData->trackerData.resize(p_TrackerStreamInfo->trackerCount);
+		t_TrackerData->publishTime = p_TrackerStreamInfo->publishTime.time;
+		t_TrackerData->receiveMonotonicMs = t_ReceiveMonotonicMs;
 
 		for (uint32_t i = 0; i < p_TrackerStreamInfo->trackerCount; i++)
 		{
@@ -368,6 +423,7 @@ void SDKMinimalClient::OnTrackerStreamCallback(const TrackerStreamInfo* const p_
 		// s_Instance->SendTrackerData(t_TrackerData);
 
 		s_Instance->m_TrackerMutex.lock();
+		t_TrackerData->callbackIndex = ++s_Instance->m_TrackerCallbackCounter;
 		if (s_Instance->m_NextTrackerData != nullptr) delete s_Instance->m_NextTrackerData;
 		s_Instance->m_NextTrackerData = t_TrackerData;
 		s_Instance->m_TrackerMutex.unlock();
@@ -422,13 +478,35 @@ std::string SDKMinimalClient::CombinedToJSON(const ClientRawSkeletonCollection* 
 	std::stringstream json;
 	json << std::fixed << std::setprecision(6);
 
-	// Get current timestamp (milliseconds)
-	auto now = std::chrono::system_clock::now();
-	auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+	const uint64_t ms = SystemNowMs();
+	const uint64_t combinedMonotonicMs = SteadyNowMs();
 
 	json << "{";
 	json << "\"timestamp\":" << ms << ",";
 	json << "\"frame\":" << m_FrameCounter << ",";
+	json << "\"combined_monotonic_ms\":" << combinedMonotonicMs << ",";
+
+	json << "\"skeleton_publish_time\":";
+	WriteNullableTimestamp(json, skeletonData ? skeletonData->publishTime : 0);
+	json << ",";
+	json << "\"skeleton_receive_monotonic_ms\":";
+	WriteNullableTimestamp(json, skeletonData ? skeletonData->receiveMonotonicMs : 0);
+	json << ",";
+	json << "\"skeleton_frame\":null,";
+	json << "\"skeleton_callback_index\":";
+	WriteNullableTimestamp(json, skeletonData ? skeletonData->callbackIndex : 0);
+	json << ",";
+
+	json << "\"tracker_publish_time\":";
+	WriteNullableTimestamp(json, trackerData ? trackerData->publishTime : 0);
+	json << ",";
+	json << "\"tracker_receive_monotonic_ms\":";
+	WriteNullableTimestamp(json, trackerData ? trackerData->receiveMonotonicMs : 0);
+	json << ",";
+	json << "\"tracker_frame\":null,";
+	json << "\"tracker_callback_index\":";
+	WriteNullableTimestamp(json, trackerData ? trackerData->callbackIndex : 0);
+	json << ",";
 
 	// Add skeleton data
 	json << "\"skeletons\":";
@@ -488,7 +566,9 @@ std::string SDKMinimalClient::CombinedToJSON(const ClientRawSkeletonCollection* 
 			json << "\"position\":[" << pos.x << "," << pos.y << "," << pos.z << "],";
 			json << "\"rotation\":[" << rot.x << "," << rot.y << "," << rot.z << "," << rot.w << "],";
 			json << "\"quality\":" << static_cast<int>(tracker.quality) << ",";
-			json << "\"valid\":" << (tracker.quality != TrackingQuality::TrackingQuality_Untrackable ? "true" : "false");
+			json << "\"valid\":" << (tracker.quality != TrackingQuality::TrackingQuality_Untrackable ? "true" : "false") << ",";
+			json << "\"last_update_time\":";
+			WriteNullableTimestamp(json, tracker.lastUpdateTime.time);
 
 			if (trackerIdx < trackerData->trackerData.size() - 1) {
 				json << "},";
@@ -513,19 +593,8 @@ void SDKMinimalClient::SendTrackerData(const TrackerDataCollection* data) {
 
 	try {
 		std::string jsonData = TrackerToJSON(data);
-
-		// Add newline as message separator
-		jsonData += "\n";
-
-		// Send data
-		int bytesSent = send(m_ClientSocket, jsonData.c_str(), static_cast<int>(jsonData.length()), 0);
-
-		if (bytesSent < 0) {
-			// Send failed, connection may be broken
-			ClientLog::warn("Failed to send tracker data to Python. Socket may be disconnected.");
-			CloseSocket();
-		} else {
-			ClientLog::print("[TRACKER] Successfully sent {} bytes to Python", bytesSent);
+		if (SendJsonLine(jsonData)) {
+			ClientLog::print("[TRACKER] Successfully sent tracker JSONL to Python");
 		}
 	} catch (const std::exception& e) {
 		ClientLog::error("Error sending tracker data: {}", e.what());
@@ -591,33 +660,43 @@ void SDKMinimalClient::Run()
 
 	while (m_Running)
 	{
-		// check if there is new skeleton data available.
+		bool hasNewSkeletonData = false;
+		bool hasNewTrackerData = false;
+
+		// Move newly received skeleton data into the latest cache.
 		m_RawSkeletonMutex.lock();
 
-		delete m_RawSkeleton;
-		m_RawSkeleton = m_NextRawSkeleton;
-		m_NextRawSkeleton = nullptr;
+		if (m_NextRawSkeleton != nullptr)
+		{
+			delete m_RawSkeleton;
+			m_RawSkeleton = m_NextRawSkeleton;
+			m_NextRawSkeleton = nullptr;
+			hasNewSkeletonData = true;
+		}
 
 		m_RawSkeletonMutex.unlock();
 
-		// check if there is new tracker data available.
+		// Move newly received tracker data into the latest cache.
 		m_TrackerMutex.lock();
 
-		delete m_TrackerData;
-		m_TrackerData = m_NextTrackerData;
-		m_NextTrackerData = nullptr;
+		if (m_NextTrackerData != nullptr)
+		{
+			delete m_TrackerData;
+			m_TrackerData = m_NextTrackerData;
+			m_NextTrackerData = nullptr;
+			hasNewTrackerData = true;
+		}
 
 		m_TrackerMutex.unlock();
 
-		if (m_RawSkeleton != nullptr && m_RawSkeleton->skeletons.size() != 0)
+		if (hasNewSkeletonData && m_RawSkeleton != nullptr && m_RawSkeleton->skeletons.size() != 0)
 		{
 			// print whenever new data is available
-			ClientLog::print("raw skeleton data obtained for frame: {}.", std::to_string(m_FrameCounter));
+			ClientLog::print("raw skeleton data obtained for callback: {}.", std::to_string(m_RawSkeleton->callbackIndex));
 			PrintRawSkeletonNodeInfo();
-			m_FrameCounter++;
 		}
 
-		if (m_TrackerData != nullptr && m_TrackerData->trackerData.size() != 0)
+		if (hasNewTrackerData && m_TrackerData != nullptr && m_TrackerData->trackerData.size() != 0)
 		{
 			// Added: Print Tracker data information
 			ClientLog::print("[TRACKER] {} tracker(s) data obtained", m_TrackerData->trackerData.size());
@@ -628,28 +707,22 @@ void SDKMinimalClient::Run()
 			}
 		}
 
-			// Send combined skeleton and tracker data to Python
+		// Send one combined JSONL frame only when at least one stream has new callback data.
+		if (hasNewSkeletonData || hasNewTrackerData) {
 			if (m_ClientSocket != INVALID_SOCKET_VAL && m_SocketInitialized) {
-				if ((m_RawSkeleton != nullptr && m_RawSkeleton->skeletons.size() != 0) ||
-				    (m_TrackerData != nullptr && m_TrackerData->trackerData.size() != 0)) {
-					try {
-						std::string jsonData = CombinedToJSON(m_RawSkeleton, m_TrackerData);
-						jsonData += " \n ";  // Add newline as message separator
-
-						int bytesSent = send(m_ClientSocket, jsonData.c_str(), static_cast<int>(jsonData.length()), 0);
-						if (bytesSent < 0) {
-							ClientLog::warn("Failed to send combined data to Python. Socket may be disconnected.");
-							CloseSocket();
-						} else {
-							ClientLog::print("[COMBINED] Successfully sent {} bytes to Python (frame: {})", bytesSent, m_FrameCounter);
-						}
-					} catch (const std::exception& e) {
-						ClientLog::error("Error sending combined data: {}", e.what());
+				try {
+					std::string jsonData = CombinedToJSON(m_RawSkeleton, m_TrackerData);
+					if (SendJsonLine(jsonData)) {
+						ClientLog::print("[COMBINED] Successfully sent frame {} to Python", m_FrameCounter);
+						m_FrameCounter++;
 					}
+				} catch (const std::exception& e) {
+					ClientLog::error("Error sending combined data: {}", e.what());
 				}
 			}
+		}
 
-		std::this_thread::sleep_for(std::chrono::milliseconds(33)); // Roughly 30fps, good enough to show the results, but too slow to retrieve all data.
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
 
 		if (GetKeyDown(' ')) // press space to exit
 		{

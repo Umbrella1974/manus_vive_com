@@ -10,6 +10,7 @@
 
 #include "ClientPlatformSpecific.hpp"
 #include "ManusSDK.h"
+#include <cstdint>
 #include <mutex>
 #include <vector>
 #include <string>
@@ -72,6 +73,9 @@ class ClientRawSkeletonCollection
 {
 public:
 	std::vector<ClientRawSkeleton> skeletons;
+	uint64_t publishTime = 0;
+	uint64_t receiveMonotonicMs = 0;
+	uint64_t callbackIndex = 0;
 };
 
 /// @brief Used to store all the tracker data coming from Core.
@@ -79,6 +83,9 @@ class TrackerDataCollection
 {
 public:
 	std::vector<TrackerData> trackerData;
+	uint64_t publishTime = 0;
+	uint64_t receiveMonotonicMs = 0;
+	uint64_t callbackIndex = 0;
 };
 
 class SDKMinimalClient : public SDKClientPlatformSpecific
@@ -105,6 +112,7 @@ public:
 	std::string SkeletonToJSON(const ClientRawSkeletonCollection* data);
 	std::string TrackerToJSON(const TrackerDataCollection* data);
 	std::string CombinedToJSON(const ClientRawSkeletonCollection* skeletonData, const TrackerDataCollection* trackerData);
+	bool SendJsonLine(const std::string& jsonData);
 
 protected:
 
@@ -119,11 +127,13 @@ protected:
 	std::mutex m_RawSkeletonMutex;
 	ClientRawSkeletonCollection* m_NextRawSkeleton = nullptr;
 	ClientRawSkeletonCollection* m_RawSkeleton = nullptr;
+	uint64_t m_SkeletonCallbackCounter = 0;
 
 	// Add: Tracker related member variables
 	std::mutex m_TrackerMutex;
 	TrackerDataCollection* m_NextTrackerData = nullptr;
 	TrackerDataCollection* m_TrackerData = nullptr;
+	uint64_t m_TrackerCallbackCounter = 0;
 
 	uint32_t m_FrameCounter = 0;
 

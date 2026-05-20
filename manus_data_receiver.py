@@ -8,10 +8,17 @@ import socket
 import json
 import threading
 import time
+from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
 
 class ManusDataReceiver:
-    def __init__(self, host: str = "127.0.0.1", port: int = 8888):
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 8888,
+        raw_jsonl_path: Optional[str] = None,
+        flush_raw_jsonl: bool = True,
+    ):
         """初始化数据接收器"""
         self.host = host
         self.port = port
@@ -22,6 +29,9 @@ class ManusDataReceiver:
         self.latest_data = None
         self.latest_tracker_data = None
         self.callbacks = []
+        self.raw_jsonl_path = Path(raw_jsonl_path) if raw_jsonl_path is not None else None
+        self.flush_raw_jsonl = flush_raw_jsonl
+        self.raw_jsonl_file = None
 
         # 数据统计
         self.frame_count = 0
@@ -34,6 +44,8 @@ class ManusDataReceiver:
 
     def start(self):
         """启动TCP服务器"""
+        self._open_raw_jsonl()
+
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.server_socket.bind((self.host, self.port))
@@ -54,6 +66,36 @@ class ManusDataReceiver:
         receive_thread.start()
 
         return True
+
+    def _open_raw_jsonl(self):
+        """Open raw JSONL output if capture is enabled."""
+        if self.raw_jsonl_path is None or self.raw_jsonl_file is not None:
+            return
+
+        self.raw_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+        self.raw_jsonl_file = self.raw_jsonl_path.open("a", encoding="utf-8")
+        print(f"[RAW] 保存 raw JSONL 到: {self.raw_jsonl_path}")
+
+    def _write_raw_jsonl(self, frame_data: Dict[str, Any]):
+        """Write the received frame exactly as parsed, without adding fields."""
+        if self.raw_jsonl_file is None:
+            return
+
+        try:
+            self.raw_jsonl_file.write(json.dumps(frame_data, ensure_ascii=False) + "\n")
+            if self.flush_raw_jsonl:
+                self.raw_jsonl_file.flush()
+        except Exception as e:
+            print(f"[ERROR] 写入 raw JSONL 失败: {e}")
+            self._close_raw_jsonl()
+
+    def _close_raw_jsonl(self):
+        """Close raw JSONL output if it is open."""
+        if self.raw_jsonl_file is not None:
+            try:
+                self.raw_jsonl_file.close()
+            finally:
+                self.raw_jsonl_file = None
 
     def _receive_data(self):
         """接收数据的线程函数"""
@@ -95,6 +137,7 @@ class ManusDataReceiver:
     def _process_frame(self, frame_data: Dict[str, Any]):
         """处理一帧数据（支持骨架和Tracker混合数据）"""
         self.frame_count += 1
+        self._write_raw_jsonl(frame_data)
 
         # 处理骨架数据
         if 'skeletons' in frame_data:
@@ -283,6 +326,8 @@ class ManusDataReceiver:
         if self.server_socket:
             self.server_socket.close()
             self.server_socket = None
+
+        self._close_raw_jsonl()
 
         print("[STOP] 数据接收器已停止")
 
