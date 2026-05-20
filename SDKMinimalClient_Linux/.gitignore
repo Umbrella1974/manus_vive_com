@@ -21,3 +21,7 @@ obj/
 
 # Large SDK binary libraries
 SDKClient_Linux/ManusSDK/lib/*.so
+
+# Manus SDK binary libraries
+SDKMinimalClient_Linux/ManusSDK/lib/*.so
+SDKClient_Linux/ManusSDK/lib/*.so
